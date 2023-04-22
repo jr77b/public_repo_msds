@@ -1,0 +1,188 @@
+---
+title: "NYPD Shooting Incident Data"
+author: "J. Briggs"
+date: "2023-03-30"
+output:
+  html_document: default
+  mainfont: Helvetica
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+devtools::install_github("zachcp/nycmaps")
+library(tidyverse)
+library(lubridate)
+library(maps)
+library(nycmaps)
+library(gmapsdistance)
+map(database="nyc")
+set.api.key("AIzaSyC2OvWV_GXc2krOk7EAOT--JW1skvCSOn0")
+##google project: PRJMSDSmapping-jobr
+#API KEY: AIzaSyC2OvWV_GXc2krOk7EAOT--JW1skvCSOn0
+#
+```
+
+## NYPD Shooting Data Assignment
+This is my first time using R.  I am going to attempt to analyze this data spatially.  Loading map data from "NYC map from: https://github.com/zachcp/nycmaps".  Libararies loaded: Tidyverse, Lubridate, maps, gmapsdistance & nycmaps.
+Started a G-cloud project to use the distance mapping API from Google to determine the driving distance to an applicable hospital.
+
+Initial look at the data has the following columns with holes in the data or the column is ambiguous.  Eliminated columns are listed below. OCCUR_DATE is changed to a 'Date' Data type.  Created a YEAR column from the OCCUR_DATE.  Renamed the STATISTICAL MURDER FLAG to "SMF".
+
+Filtering the initial dataset to years 2016 through 2021 because I will be calling Google APIs to do distance calculations.
+
+```{r DS1, message=FALSE, echo=TRUE}
+file1 <- "https://data.cityofnewyork.us/api/views/833y-fsy8/rows.csv?accessType=DOWNLOAD"
+
+ds1 <- read_csv(file1) %>%
+  select(-c(PRECINCT, JURISDICTION_CODE, LOCATION_DESC, PERP_AGE_GROUP, PERP_SEX, PERP_RACE, X_COORD_CD, Y_COORD_CD, Lon_Lat)) %>%
+  mutate(OCCUR_DATE = mdy(OCCUR_DATE)) %>%
+  mutate(YEAR = year(OCCUR_DATE)) %>%
+  rename(SMF = STATISTICAL_MURDER_FLAG)
+  
+ds2 <- filter(ds1, YEAR >= 2016)
+```
+
+## Years 2016 - 2021 & All NYC Boroughs
+Quick scatter plot to see how the data is looking.  This required some trial and error to get the sizing to work.
+
+```{r FIRST_PLOT, message=FALSE, echo=TRUE}
+nyc <- map_data("nyc")
+gg  <- ggplot()
+nymap <- gg + geom_map(data=nyc, map=nyc, aes(map_id=region))
+allnymap <- nymap + geom_point(data=ds2, aes(x=Longitude, y=Latitude, colour = factor(SMF)), alpha = 0.75, size = .1)
+allnymap
+```
+
+## Hospitals Map & All NYC Boroughs
+Overlay the hospitals over the incident data. Only interested in hospitals that regulary care for those with this type of injury (Acute Care). For clean up, there were extra characters that would not work with the Google API, Those were eliminated.  There is also some unnecessary conversion to numeric that are later converted back to characters (strings), this was a misunderstanding on my part dealing with the Google's Distance Matrix API.  Lastly, Hospitals are overlayed as green plus signs on top of the original scatter for Incident data.
+
+```{r Hospitals, message=FALSE, echo=TRUE}
+Hospitals = read_csv("https://data.cityofnewyork.us/api/views/833h-xwsx/rows.csv?accessType=DOWNLOAD")
+#Eliminate Pediatric and Nursing Homes
+Filtered_Hospitals <- Hospitals %>%
+  filter(`Facility Type` == 'Acute Care Hospital')
+#Clean up
+Tidied_Hospitals <- Filtered_Hospitals %>%
+  separate(col = "Location 1", into = c("Address", "Lat_Lon"), sep = -35) %>%
+  mutate(Lat_Lon = gsub('\n', "", Lat_Lon)) %>%
+  mutate(Lat_Lon = gsub("[()]", "", Lat_Lon)) %>%
+  mutate(Lat_Lon2 = Lat_Lon) %>%
+  separate(col = "Lat_Lon2", into = c("Latitude", "Longitude"), sep = ",") %>%
+  mutate(Latitude = as.numeric(Latitude)) %>%
+  mutate(Longitude = as.numeric(Longitude))
+#Overlayed Green "+" as hospitals over the 2016<->2021 incident data
+NycIncHospMap1 <- nymap  + geom_point(data=ds2, aes(x=Longitude, y=Latitude, colour = factor(SMF)), alpha = 0.75, size = .1) + geom_point(data=Tidied_Hospitals, aes(x=Longitude, y=Latitude), colour = "green", size = 2, shape = "plus", stroke = 2)
+NycIncHospMap1
+```
+
+## Hospitals & 4 NYC Boroughs 
+Eliminating the entries from Staten Island because the hospital data I found did not have Lat/Long coordinates. Here I created the Lat_Long column as characters with a comma separator since this is what the API expects.  Created a numeric column to hold the "Minimum Distance to a Hospital" (MDH) that is returned by the API.  Created another map of incidents and hospitals without Staten Island.
+
+```{r make_fourNYCB, message=FALSE, echo=TRUE}
+fourNYCB <- filter(ds2, `BORO` != 'STATEN ISLAND') %>%
+  select(-c(INCIDENT_KEY, OCCUR_DATE, OCCUR_TIME, VIC_AGE_GROUP, VIC_SEX, VIC_RACE)) %>%
+  mutate(Lat_Long = paste(as.character(Latitude), as.character(Longitude), sep=", "))
+
+fourNYCB$MDH <- 0
+
+fourNYCB %>% as_tibble() %>% print(n=5)
+
+NycIncHospMap2 <- nymap  + 
+  geom_point(data=fourNYCB, aes(x=Longitude, y=Latitude, colour = factor(SMF)), alpha = 0.75, size = .1) + 
+  geom_point(data=Tidied_Hospitals, aes(x=Longitude, y=Latitude), colour = "green", size = 2, shape = "plus", stroke = 2)
+NycIncHospMap2
+```
+
+## Make API Calls & Write to CSV.
+Here we take the filtered data set fourNYCB, filled the MDH column with the min distance to the hospital as calculated by the Google API through gmapsdistance. This is the first commented out section with the FOR loop. the resulting data set was written back to a csv file (so that I don't have to pay for too much API usage, or wait the hours it took to make those 86,141 API calls).  This csv file is placed in the public cloud so that it may be read back in for reproducibility.
+
+```{r modify_fourNYCB, message=FALSE, echo=TRUE}
+#min_dist function to API call - Determines the closest hospital. (11 API calls per shooting incident)
+min_dist <- function(Shooting_Lat_Lon) {
+    Hosp1 <- gmapsdistance(origin = "40.738710402563, -73.878351155182", destination = Shooting_Lat_Lon)
+    Hosp2 <- gmapsdistance(origin = "40.857397104611, -73.846571204087", destination = Shooting_Lat_Lon)
+    Hosp3 <- gmapsdistance(origin = "40.784557024105, -73.943795653643", destination = Shooting_Lat_Lon)
+    Hosp4 <- gmapsdistance(origin = "40.880463372456, -73.881592877502", destination = Shooting_Lat_Lon)
+    Hosp5 <- gmapsdistance(origin = "40.655761808605, -73.944662615537", destination = Shooting_Lat_Lon)
+    Hosp6 <- gmapsdistance(origin = "40.73962320748, -73.976572846645", destination = Shooting_Lat_Lon)
+    Hosp7 <- gmapsdistance(origin = "40.586645433957, -73.965830115778", destination = Shooting_Lat_Lon)
+    Hosp8 <- gmapsdistance(origin = "40.71311535449, -73.792820999789", destination = Shooting_Lat_Lon)
+    Hosp9 <- gmapsdistance(origin = "40.817688484049, -73.924200271483", destination = Shooting_Lat_Lon)
+    Hosp10 <- gmapsdistance(origin = "40.814275217502, -73.940602831291", destination = Shooting_Lat_Lon)
+    Hosp11 <- gmapsdistance(origin = "40.70052661478, -73.941643858765", destination = Shooting_Lat_Lon)
+    min_distance <- min(Hosp1$Distance, Hosp2$Distance, Hosp3$Distance, Hosp4$Distance, Hosp5$Distance, Hosp6$Distance
+    , Hosp7$Distance, Hosp8$Distance, Hosp9$Distance, Hosp10$Distance, Hosp11$Distance)
+    return(min_distance)
+}
+
+# modify for new column in fourNYCB. - comment out section when complete
+# for (i in 1:nrow(fourNYCB)) {
+#   n <- min_dist(fourNYCB$Lat_Long[i])
+#   fourNYCB$MDH[i] <- n
+# }
+
+# writing the results to a csv file locally. I will then move this to a Google Drive URL for reading.
+# when/if this works - this section will be commented out, but will remain visible.
+#write.csv(fourNYCB,'/Users/jon/Downloads/fnhd.csv')
+```
+```{r Read4NYCB_HospDistR, message=FALSE, echo=TRUE}
+hdf <- "https://drive.google.com/uc?export=download&id=1KmJHQ-BAdua-vt5VD0-BHt4SFkqHf83w"
+fourNYCB_HospDistR <- read_csv(hdf)
+fourNYCB_HospDistR %>% as_tibble() %>% print(n=5)
+```
+
+#### Hyp: If the inicdent is farther away from hospital, is result of death/murder more likely??
+Box Plot. MDH is the minimum distance to a hospital in meters (according to Google Maps).
+```{r Visualization, message=FALSE, echo=TRUE}
+Visualization <- fourNYCB_HospDistR %>% ggplot(aes(x = SMF, y = MDH)) +
+  geom_boxplot() 
+Visualization
+```
+
+```{r Function to add Summary Statistics to Boxplot, message=FALSE, echo=TRUE}
+summ_stats <- function(y, upper_limit = max(fourNYCB_HospDistR$MDH) * 1.15) {
+  return(data.frame(y = 0.95 * upper_limit,
+    label = paste(
+      "Total Incidents =", length(y), "\n",
+      "Mean =", round(mean(y), 2), "\n",
+      "Standard Deviation =", round(sd(y), 2), "\n"
+    )
+  ))
+}
+
+Updated_Vis <- Visualization + stat_summary(fun.data = summ_stats, geom = "text", size = 2, position = position_dodge())
+
+Updated_Vis
+```
+
+Added mean, standard deviation, and sample size for each value of the statistical murder flag (True versus False). Want to perform Two Sample T-Test to see if mean minimum distance to a hospital is  significantly different between incidents that ended in a death (SMF = True) versus incidents that did not end in a death (SMF = False). 
+
+Null hypothesis will be that there is not a statistically significant difference in the mean distance to a hospital between the groups. 
+
+Before performing T-Test, need to perform an F-Test to see if there is a statistically significant difference in the variance of the data between the two groups.
+
+```{r F-Test for Difference in Variance, message=FALSE, echo=TRUE}
+var.test(MDH ~ SMF, fourNYCB_HospDistR)
+```
+
+This test shows us that there is not evidence to support a statistically significant difference in the variance of the two groups. We can see this by looking at the p-value, which is 0.1364, and not low enough to disprove the null hypothesis that the true ratio of the variances is equal to 1 (they are equal between the groups). 
+
+Due to this, we will perform a two-sample t-test assuming equal variances. 
+
+```{r Two Sample T-Test, message=FALSE, echo=TRUE}
+t.test(MDH ~ SMF, fourNYCB_HospDistR, var.equal = TRUE)
+```
+
+This test shows that there is a statistically significant difference in the means between the two groups (SMF = False and SMF = True). We can see this by looking at the p-value, which is 0.04244. As it is lower than 0.05, it supports rejection of the null hypothesis that the difference in the means between the groups is zero (there is no difference). 
+
+It also shows us that the estimated mean minimum distance to a hospital for incidents that resulted in death is greater than the estimated mean minimum distance to a hospital for incidents that did not result in death. 
+
+This being said, I would be cautious to make a conclusion that, overall, an incident is more likely to result in death if it occurred further from a hospital. 
+
+
+
+
+
+
+
+
